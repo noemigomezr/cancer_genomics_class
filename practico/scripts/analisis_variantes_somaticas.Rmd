@@ -1,0 +1,476 @@
+---
+title: "Analisis de variantes somaticas"
+author: "Noemi Gomez"
+date: "2026-10-13"
+output:
+  html_document:
+    keep_md: true
+---
+
+# Parte 1 maftools
+
+```{r setup}
+# install.packages("BiocManager")
+# install.packages("tidyverse")
+# BiocManager::install("maftools")
+
+library(BiocManager)
+library(tidyverse)
+library(maftools)
+
+packageVersion("BiocManager")
+packageVersion("tidyverse")
+packageVersion("maftools")
+```
+
+```{r cargar-datos}
+data_mutations <- read_tsv("../files/data_mutations.txt", show_col_types = FALSE)
+data_clinical_sample <- read_tsv("../files/data_clinical_sample.txt",
+                                 comment = "#", show_col_types = FALSE)
+data_clinical_patient <- read_tsv("../files/data_clinical_patient.txt",
+                                  comment = "#", show_col_types = FALSE)
+
+head(data_mutations)
+head(data_clinical_sample)
+head(data_clinical_patient)
+```
+
+```{r crear-metadata}
+muestras_evaluadas <- data_mutations %>%
+  distinct(Tumor_Sample_Barcode)
+
+metadata <- data_clinical_sample %>%
+  mutate(Tumor_Sample_Barcode = SAMPLE_ID) %>%
+  semi_join(muestras_evaluadas, by = "Tumor_Sample_Barcode") %>%
+  left_join(data_clinical_patient, by = "PATIENT_ID")
+
+head(metadata)
+```
+
+```{r agregar-wgd}
+data_wgd <- read_tsv("../files/wgd_tcga.tsv", show_col_types = FALSE) %>%
+  select(Tumor_Sample_Barcode = array, WGD = `Genome doublings`, purity) %>%
+  mutate(WGD = WGD > 0)
+
+metadata <- metadata %>%
+  left_join(data_wgd, by = "Tumor_Sample_Barcode")
+
+head(metadata)
+```
+
+```{r filtrar-pass}
+table(data_mutations$FILTER, useNA = "ifany")
+
+data_mutations <- data_mutations %>%
+  filter(FILTER == "PASS")
+```
+
+```{r filtrar-cromosomas}
+data_mutations <- data_mutations %>%
+  filter(Chromosome %in% as.character(1:22))
+```
+
+```{r preparar-anotaciones-clinicas}
+metadata <- metadata %>%
+  mutate(SUBTYPE = str_remove(SUBTYPE, "^(COAD|READ)_"))
+```
+
+```{r crear-maf}
+maf <- read.maf(maf = data_mutations, clinicalData = metadata)
+```
+
+```{r gene-summary}
+getGeneSummary(maf)
+```
+
+```{r sample-summary}
+getSampleSummary(maf)
+```
+
+```{r plot-summary, fig.width=12, fig.height=8}
+plotmafSummary(maf = maf, addStat = "median")
+```
+
+```{r oncoplot-normal, fig.width=15, fig.height=10}
+muestras_por_tmb <- metadata %>%
+  filter(Tumor_Sample_Barcode %in% getSampleSummary(maf)$Tumor_Sample_Barcode) %>%
+  arrange(desc(TMB_NONSYNONYMOUS)) %>%
+  pull(Tumor_Sample_Barcode)
+
+oncoplot(maf = maf, top = 10, sampleOrder = muestras_por_tmb)
+```
+
+```{r oncoplot-anotado, fig.width=15, fig.height=12}
+oncoplot(maf = maf, top = 10, sampleOrder = muestras_por_tmb,
+         clinicalFeatures = c("ONCOTREE_CODE", "SUBTYPE", "WGD", "SEX"),
+         annotationColor = list(
+           ONCOTREE_CODE = c(COAD = "brown2", READ = "steelblue", MACR = "lightgreen"),
+           SUBTYPE = c(POLE = "hotpink1", CIN = "blue", MSI = "orange2", GS = "darkgreen"),
+           WGD = c("FALSE" = "gray", "TRUE" = "gold2"),
+           SEX = c(Female = "lightcoral", Male = "skyblue")
+         ),
+         annotationFontSize = 0.8, legendFontSize = 1)
+```
+
+```{r titv, fig.width=12, fig.height=6}
+maf_titv <- titv(maf = maf, plot = FALSE, useSyn = TRUE)
+plotTiTv(res = maf_titv)
+```
+
+```{r lollipop-apc, fig.width=10, fig.height=4}
+lollipopPlot(maf = maf, gene = "APC", AACol = "HGVSp_Short")
+lollipopPlot(maf = maf, gene = "KRAS", AACol = "HGVSp_Short")
+```
+
+```{r lollipop-tp53, fig.width=12, fig.height=6}
+lollipopPlot(maf = maf, gene = "TP53", AACol = "HGVSp_Short")
+```
+
+```{r lollipop-braf, fig.width=12, fig.height=6}
+lollipopPlot(maf = maf, gene = "BRAF", AACol = "HGVSp_Short")
+```
+
+```{r lollipop-ttn, fig.width=14, fig.height=6}
+lollipopPlot(maf = maf, gene = "TTN", AACol = "HGVSp_Short")
+```
+
+```{r tcga-compare, fig.width=15, fig.height=7}
+# Tamano de captura asumido: 50 Mb.
+maf_mutload <- tcgaCompare(maf = maf, cohortName = "CRC",
+                          logscale = TRUE, capture_size = 50)
+```
+
+# Parte 2
+
+```{r resumen-maf-parte2}
+resumen_genes <- getGeneSummary(maf)
+resumen_muestras <- getSampleSummary(maf)
+
+head(resumen_genes)
+head(resumen_muestras)
+```
+
+## multi-hit y TMB
+
+```{r matriz-gen-muestra}
+matriz_gen_muestra <- as_tibble(maf@data) %>%
+  count(Hugo_Symbol, Tumor_Sample_Barcode, name = "n_mutaciones") %>%
+  pivot_wider(names_from = Tumor_Sample_Barcode,
+              values_from = n_mutaciones, values_fill = 0) %>%
+  column_to_rownames("Hugo_Symbol") %>%
+  as.matrix()
+
+dim(matriz_gen_muestra)
+```
+
+```{r tabla-multihit-muestras}
+tabla_multihit <- tibble(
+  Tumor_Sample_Barcode = colnames(matriz_gen_muestra),
+  n_genes_multihit = colSums(matriz_gen_muestra >= 2)
+) %>%
+  left_join(metadata %>% select(Tumor_Sample_Barcode, TMB_NONSYNONYMOUS, SUBTYPE),
+            by = "Tumor_Sample_Barcode") %>%
+  mutate(SUBTYPE = factor(SUBTYPE, levels = c("CIN", "MSI", "POLE", "GS")))
+
+head(tabla_multihit)
+table(tabla_multihit$SUBTYPE, useNA = "ifany")
+```
+
+```{r regresion-multihit-tmb}
+modelo_multihit_tmb <- lm(n_genes_multihit ~ TMB_NONSYNONYMOUS,
+                          data = tabla_multihit)
+resumen_modelo <- summary(modelo_multihit_tmb)
+resumen_modelo
+
+# El p-value prueba la asociacion de la pendiente; no demuestra linealidad.
+p_multihit_tmb <- resumen_modelo$coefficients["TMB_NONSYNONYMOUS", "Pr(>|t|)"]
+```
+
+```{r scatter-multihit-tmb, fig.width=9, fig.height=6}
+r2 <- round(resumen_modelo$r.squared, 3)
+p_valor <- signif(p_multihit_tmb, 3)
+texto_regresion <- paste("Regresion lineal: R2 =", r2, "; p =", p_valor)
+
+ggplot(tabla_multihit, aes(x = TMB_NONSYNONYMOUS, y = n_genes_multihit)) +
+  geom_point(aes(color = SUBTYPE), alpha = 0.7) +
+  geom_smooth(method = "lm", formula = y ~ x, color = "black") +
+  labs(x = "TMB (mutaciones/Mb)", y = "Numero de genes con multi-hit",
+       color = "Subtipo", subtitle = texto_regresion) + theme_classic()
+```
+
+```{r multihit-subtipos, fig.width=6, fig.height=3}
+resumen_multihit_subtipos <- tabla_multihit %>%
+  filter(!is.na(SUBTYPE)) %>% group_by(SUBTYPE) %>%
+  summarise(n_muestras = n(),
+            mediana_multihit = median(n_genes_multihit),
+            .groups = "drop")
+
+resumen_multihit_subtipos
+kruskal.test(n_genes_multihit ~ SUBTYPE, data = tabla_multihit)
+ggplot(tabla_multihit %>% filter(!is.na(SUBTYPE)),
+       aes(x = SUBTYPE, y = n_genes_multihit, fill = SUBTYPE)) +
+  geom_boxplot(outlier.shape = NA) +
+  geom_jitter(width = 0.15, alpha = 0.5, size = 1) +
+  scale_fill_manual(values = c(CIN = "blue", MSI = "orange2",
+                               POLE = "hotpink1", GS = "darkgreen")) +
+  labs(x = "Subtipo de cancer colorrectal", y = "Numero de genes con multi-hit") +
+  theme_classic()
+```
+
+## MSI
+
+MSI es TRUE si SUBTYPE es MSI y FALSE en los demas casos.
+
+```{r matriz-binaria}
+matriz_binaria <- ifelse(matriz_gen_muestra > 0, TRUE, FALSE)
+dim(matriz_binaria)
+```
+
+```{r filtro-genes-modelos}
+# Contar muestras mutadas en toda la matriz, sin distinguir por MSI.
+genes_modelo <- rownames(matriz_binaria)[rowSums(matriz_binaria) >= 5]
+length(genes_modelo)
+```
+
+```{r metadata-regresion-msi}
+metadata_msi <- metadata %>%
+  select(Tumor_Sample_Barcode, SUBTYPE, purity, SEX, AGE) %>%
+  filter(Tumor_Sample_Barcode %in% colnames(matriz_binaria)) %>%
+  mutate(MSI = SUBTYPE == "MSI", SEX = factor(SEX))
+
+# Muestras con subtipo, pureza, sexo y edad para los modelos.
+metadata_msi <- metadata_msi %>% drop_na(MSI, purity, SEX, AGE)
+table(metadata_msi$MSI)
+```
+
+```{r regresion-msh2}
+datos_msh2 <- metadata_msi
+datos_msh2$MSH2 <- matriz_binaria["MSH2", datos_msh2$Tumor_Sample_Barcode]
+
+modelo_msh2 <- glm(MSH2 ~ MSI + AGE + SEX + purity,
+                   data = datos_msh2, family = binomial())
+
+tabla_msh2 <- as.data.frame(summary(modelo_msh2)$coefficients)
+tabla_msh2$OR <- exp(tabla_msh2$Estimate)
+
+tabla_msh2
+```
+
+```{r regresion-logistica-msi}
+# Cada gen es la respuesta binaria; se extrae el coeficiente de MSI.
+resultados_msi <- data.frame(gen = genes_modelo,
+                             beta = NA_real_, p_value = NA_real_)
+
+for (i in seq_len(nrow(resultados_msi))) {
+  datos <- metadata_msi
+  datos$mutacion <- matriz_binaria[resultados_msi$gen[i], datos$Tumor_Sample_Barcode]
+
+  modelo <- glm(mutacion ~ MSI + AGE + SEX + purity,
+                data = datos, family = binomial())
+
+  if (modelo$converged && !anyNA(coef(modelo))) {
+    coeficiente <- summary(modelo)$coefficients["MSITRUE", ]
+    OR_gen <- exp(coeficiente["Estimate"])
+
+    if (is.finite(OR_gen) && OR_gen > 0) {
+      resultados_msi$beta[i] <- coeficiente["Estimate"]
+      resultados_msi$p_value[i] <- coeficiente["Pr(>|z|)"]
+    }
+  }
+}
+
+resultados_msi$OR <- exp(resultados_msi$beta)
+resultados_msi$FDR <- p.adjust(resultados_msi$p_value, method = "BH")
+head(resultados_msi)
+```
+
+```{r genes-asociados-msi-true}
+genes_significativos_msi <- resultados_msi %>%
+  filter(FDR < 0.05) %>% arrange(FDR, gen)
+
+# Beta > 0: mayor probabilidad de mutacion en MSI TRUE; beta < 0: mayor en MSI FALSE.
+genes_msi_true <- genes_significativos_msi %>% filter(beta > 0)
+
+print(paste("Total de genes asociados a MSI TRUE:", nrow(genes_msi_true)))
+
+top10_msi_true <- genes_msi_true %>%
+  slice_head(n = 10) %>% select(gen, beta, OR, p_value, FDR)
+top10_msi_true
+```
+
+```{r volcano-msi, fig.width=10, fig.height=7}
+datos_volcano_msi <- resultados_msi %>%
+  filter(!is.na(FDR)) %>%
+  mutate(asociacion = case_when(
+    FDR < 0.05 & beta > 0 ~ "MSI TRUE",
+    FDR < 0.05 & beta < 0 ~ "MSI FALSE",
+    TRUE ~ "No significativo"))
+
+ggplot(datos_volcano_msi, aes(x = beta, y = -log10(FDR), color = asociacion)) +
+  geom_point(alpha = 0.5, size = 2) +
+  geom_vline(xintercept = 0, linetype = "dashed") +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed") +
+  geom_text(data = top10_msi_true, aes(x = beta, y = -log10(FDR), label = gen),
+            inherit.aes = FALSE, color = "black",
+            vjust = -0.5, size = 3, check_overlap = TRUE) +
+  scale_color_manual(values = c("MSI TRUE" = "red3", "MSI FALSE" = "steelblue",
+                                "No significativo" = "grey70")) +
+  labs(x = "Coeficiente de MSI (log OR ajustado)",
+       y = "-log10(FDR)", color = "Asociacion") +
+  theme_classic()
+```
+
+```{r estado-mutacional-apc-plxnb1, fig.width=8, fig.height=5}
+# Porcentajes observados en las mismas muestras usadas para el modelo.
+datos_estado <- metadata_msi %>%
+  select(Tumor_Sample_Barcode, MSI) %>%
+  mutate(APC = matriz_binaria["APC", Tumor_Sample_Barcode],
+         PLXNB1 = matriz_binaria["PLXNB1", Tumor_Sample_Barcode]) %>%
+  pivot_longer(c(APC, PLXNB1), names_to = "gen", values_to = "mutado")
+
+ggplot(datos_estado, aes(x = factor(MSI), fill = factor(mutado))) +
+  geom_bar(position = "fill") +
+  facet_wrap(~ gen) +
+  scale_fill_manual(values = c("FALSE" = "grey80", "TRUE" = "red3"),
+                    labels = c("FALSE" = "No mutado", "TRUE" = "Mutado")) +
+  scale_y_continuous(labels = scales::percent) +
+  labs(x = "MSI", y = "Porcentaje de muestras", fill = "Estado mutacional") +
+  theme_classic()
+```
+
+## Ancestría
+
+```{r metadata-ancestria}
+ancestria_europea <- read_tsv("../files/data_genetic_ancestry.txt",
+                             show_col_types = FALSE) %>%
+  filter(ENTITY_STABLE_ID == "EUR") %>%
+  select(-ENTITY_STABLE_ID, -NAME) %>%
+  pivot_longer(everything(), names_to = "Tumor_Sample_Barcode", values_to = "EUR") %>%
+  mutate(EUR = EUR * 100)
+
+metadata_ancestria <- metadata_msi %>%
+  left_join(ancestria_europea, by = "Tumor_Sample_Barcode") %>%
+  drop_na(EUR)
+
+nrow(metadata_ancestria)
+summary(metadata_ancestria$EUR)
+```
+
+```{r regresion-logistica-ancestria}
+# Cada gen es la respuesta; EUR es el porcentaje de ancestria europea.
+resultados_ancestria <- data.frame(gen = genes_modelo,
+                                  beta = NA_real_, p_value = NA_real_)
+
+for (i in seq_len(nrow(resultados_ancestria))) {
+  datos <- metadata_ancestria
+  datos$mutacion <- matriz_binaria[resultados_ancestria$gen[i], datos$Tumor_Sample_Barcode]
+
+  modelo <- glm(mutacion ~ MSI + AGE + SEX + purity + EUR,
+                data = datos, family = binomial())
+
+  if (modelo$converged && !anyNA(coef(modelo))) {
+    coeficiente <- summary(modelo)$coefficients["EUR", ]
+    OR_gen <- exp(coeficiente["Estimate"])
+
+    if (is.finite(OR_gen) && OR_gen > 0) {
+      resultados_ancestria$beta[i] <- coeficiente["Estimate"]
+      resultados_ancestria$p_value[i] <- coeficiente["Pr(>|z|)"]
+    }
+  }
+}
+
+resultados_ancestria$OR <- exp(resultados_ancestria$beta)
+resultados_ancestria$FDR <- p.adjust(resultados_ancestria$p_value, method = "BH")
+head(resultados_ancestria)
+```
+
+```{r genes-asociados-ancestria}
+# Beta > 0: mayor probabilidad de mutacion al aumentar EUR; beta < 0: menor.
+genes_fdr_ancestria <- resultados_ancestria %>%
+  filter(FDR < 0.05) %>%
+  arrange(FDR, gen)
+
+print(paste("Genes con FDR < 0.05, mayor EUR:", sum(genes_fdr_ancestria$beta > 0)))
+print(paste("Genes con FDR < 0.05, menor EUR:", sum(genes_fdr_ancestria$beta < 0)))
+genes_fdr_ancestria
+
+# Exploracion con p-value sin corregir; este es el criterio del volcano actual.
+genes_p_ancestria <- resultados_ancestria %>%
+  filter(p_value < 0.05) %>%
+  arrange(p_value, gen)
+
+genes_mas_eur <- genes_p_ancestria %>% filter(beta > 0)
+genes_menos_eur <- genes_p_ancestria %>% filter(beta < 0)
+
+print(paste("Genes asociados a mayor ancestria europea:", nrow(genes_mas_eur)))
+print(paste("Genes asociados a menor ancestria europea:", nrow(genes_menos_eur)))
+genes_p_ancestria
+```
+
+```{r volcano-ancestria, fig.width=10, fig.height=7}
+top10_mas_eur <- genes_mas_eur %>% slice_head(n = 10)
+top10_menos_eur <- genes_menos_eur %>% slice_head(n = 10)
+
+datos_volcano_ancestria <- resultados_ancestria %>%
+  filter(!is.na(p_value)) %>%
+  mutate(asociacion = case_when(
+    p_value < 0.05 & beta > 0 ~ "Mayor EUR",
+    p_value < 0.05 & beta < 0 ~ "Menor EUR",
+    TRUE ~ "No significativo"))
+
+ggplot(datos_volcano_ancestria, aes(x = beta, y = -log10(p_value), color = asociacion)) +
+  geom_point(alpha = 0.5, size = 2) +
+  geom_vline(xintercept = 0, linetype = "dashed") +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed") +
+  geom_text(data = bind_rows(top10_mas_eur, top10_menos_eur),
+            aes(x = beta, y = -log10(p_value), label = gen),
+            inherit.aes = FALSE, color = "black",
+            vjust = -0.5, size = 3, check_overlap = TRUE) +
+  scale_color_manual(values = c("Mayor EUR" = "red3", "Menor EUR" = "steelblue",
+                                "No significativo" = "grey70")) +
+  labs(x = "Coeficiente de ancestria europea (log OR por punto porcentual)",
+       y = "-log10(p_value)", color = "Asociacion") +
+  theme_classic()
+```
+
+```{r estado-mutacional-atm-slc5a3-eur, fig.width=8, fig.height=5}
+# Porcentaje de EUR en las mismas muestras usadas para el modelo de ancestria.
+datos_estado_eur <- metadata_ancestria %>%
+  select(Tumor_Sample_Barcode, EUR) %>%
+  mutate(ATM = matriz_binaria["ATM", Tumor_Sample_Barcode],
+         SLC5A3 = matriz_binaria["SLC5A3", Tumor_Sample_Barcode]) %>%
+  pivot_longer(c(ATM, SLC5A3), names_to = "gen", values_to = "mutado")
+
+ggplot(datos_estado_eur, aes(x = factor(mutado), y = EUR, fill = factor(mutado))) +
+  geom_boxplot(outlier.shape = NA) +
+  geom_jitter(width = 0.15, alpha = 0.5, size = 1) +
+  facet_wrap(~ gen) +
+  scale_x_discrete(labels = c("FALSE" = "No mutado", "TRUE" = "Mutado")) +
+  scale_fill_manual(values = c("FALSE" = "grey80", "TRUE" = "tomato")) +
+  labs(x = "Estado mutacional", y = "Ancestria europea (%)") +
+  theme_classic() +
+  theme(legend.position = "none")
+```
+
+```{r enriquecimiento-hallmark-msi, fig.width=10, fig.height=7}
+# BiocManager::install(c("clusterProfiler", "enrichplot"))
+# install.packages("msigdbr")
+library(clusterProfiler)
+library(msigdbr)
+library(enrichplot)
+
+# reemplaza el FDR para ser más exigente por ejemplo : 0.001 
+genes_enriquecimiento_msi <- genes_msi_true %>% filter(FDR < 0.05) %>% pull(gen) 
+hallmark <- msigdbr(species = "Homo sapiens", collection = "H") %>%
+  dplyr::select(gs_name, gene_symbol) %>% distinct()
+
+enriquecimiento_msi <- enricher(
+  gene = genes_enriquecimiento_msi,
+  universe = resultados_msi$gen[!is.na(resultados_msi$p_value)],
+  TERM2GENE = hallmark, pAdjustMethod = "BH",
+  pvalueCutoff = 0.1, qvalueCutoff = 0.2
+)
+
+dotplot(enriquecimiento_msi, showCategory = 15)
+```
+El escaso enriquecimiento Hallmark es compatible con un patrón mutacional amplio asociado a MSI y a defectos de reparación MMR. Algunas asociaciones podrían reflejar la mayor carga mutacional; ajustar por TMB permitiría evaluar asociaciones independientes de esta, sin identificar necesariamente genes causantes de MSI. Además, una lista extensa de genes puede dificultar la identificación de conjuntos específicos. Como exploración adicional, podrían seleccionarse genes mediante criterios predefinidos de FDR, OR y frecuencia mutacional.

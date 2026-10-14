@@ -1,0 +1,248 @@
+---
+title: "Analisis de firmas mutacionales SBS"
+author: "Noemi Gomez"
+date: "2026-10-13"
+output:
+  html_document:
+    keep_md: true
+---
+
+```{r setup}
+# install.packages(c("BiocManager", "tidyverse", "sigminer", "nnls", "pheatmap"))
+# BiocManager::install(c("maftools", "BSgenome.Hsapiens.UCSC.hg19"))
+
+library(BiocManager)
+library(tidyverse)
+library(maftools)
+library(sigminer)
+library(BSgenome.Hsapiens.UCSC.hg19)
+library(pheatmap)
+
+packageVersion("BiocManager")
+packageVersion("tidyverse")
+packageVersion("maftools")
+packageVersion("sigminer")
+packageVersion("nnls")
+packageVersion("BSgenome.Hsapiens.UCSC.hg19")
+packageVersion("pheatmap")
+```
+
+# Datos y filtros
+
+```{r cargar-datos}
+data_mutations <- read_tsv("../files/data_mutations.txt", show_col_types = FALSE)
+data_clinical_sample <- read_tsv("../files/data_clinical_sample.txt",
+                                 comment = "#", show_col_types = FALSE)
+data_clinical_patient <- read_tsv("../files/data_clinical_patient.txt",
+                                  comment = "#", show_col_types = FALSE)
+
+head(data_mutations)
+head(data_clinical_sample)
+head(data_clinical_patient)
+```
+
+```{r crear-metadata}
+muestras_evaluadas <- data_mutations %>%
+  distinct(Tumor_Sample_Barcode)
+
+metadata <- data_clinical_sample %>%
+  mutate(Tumor_Sample_Barcode = SAMPLE_ID) %>%
+  semi_join(muestras_evaluadas, by = "Tumor_Sample_Barcode") %>%
+  left_join(data_clinical_patient, by = "PATIENT_ID")
+
+head(metadata)
+```
+
+```{r agregar-wgd}
+data_wgd <- read_tsv("../files/wgd_tcga.tsv", show_col_types = FALSE) %>%
+  select(Tumor_Sample_Barcode = array, WGD = `Genome doublings`, purity) %>%
+  mutate(WGD = WGD > 0)
+
+metadata <- metadata %>%
+  left_join(data_wgd, by = "Tumor_Sample_Barcode")
+
+head(metadata)
+```
+
+```{r filtrar-pass}
+table(data_mutations$FILTER, useNA = "ifany")
+
+data_mutations <- data_mutations %>%
+  filter(FILTER == "PASS")
+```
+
+```{r filtrar-cromosomas}
+data_mutations <- data_mutations %>%
+  filter(Chromosome %in% as.character(1:22))
+```
+
+```{r preparar-anotaciones-clinicas}
+metadata <- metadata %>%
+  mutate(SUBTYPE = str_remove(SUBTYPE, "^(COAD|READ)_"))
+```
+
+```{r crear-maf}
+maf <- read.maf(maf = data_mutations, clinicalData = metadata)
+```
+
+# SBS
+
+```{r sbs-actividades}
+# Matriz de 96 contextos usando el MAF ya generado.
+tri <- trinucleotideMatrix(
+  maf = maf,
+  ref_genome = "BSgenome.Hsapiens.UCSC.hg19",
+  prefix = "chr", add = TRUE, useSyn = TRUE
+)
+
+sbs96 <- t(tri$nmf_matrix)
+
+# Ajustar todas las firmas COSMIC SBS por NNLS.
+fit <- sig_fit(
+  catalogue_matrix = sbs96,
+  sig_index = "ALL", sig_db = "SBS", db_type = "human-exome",
+  method = "NNLS", type = "absolute",
+  return_error = TRUE, show_index = FALSE
+)
+
+# Filas: muestras; columnas: firmas SBS.
+sbs_absolute <- t(fit$expo)
+totals <- rowSums(sbs_absolute)
+sbs_relative <- sweep(sbs_absolute, 1, pmax(totals, 1), "/") * 100
+sbs_relative[totals == 0, ] <- NA_real_
+
+head(sbs_absolute)
+head(sbs_relative)
+
+valid <- totals > 0
+sbs_qc <- data.frame(
+  Tumor_Sample_Barcode = rownames(sbs_absolute),
+  total_activity = totals,
+  cosine = fit$cosine,
+  error = fit$errors,
+  dominant_SBS = colnames(sbs_absolute)[max.col(sbs_absolute, ties.method = "first")]
+)
+sbs_qc$dominant_SBS[!valid] <- NA
+head(sbs_qc)
+```
+
+```{r sbs-prevalencia, fig.width=9, fig.height=7}
+# Actividad detectable: al menos 5% y 10 mutaciones estimadas.
+present <- sbs_relative >= 5 & sbs_absolute >= 10
+present[is.na(present)] <- FALSE
+
+sbs_summary <- data.frame(
+  SBS = colnames(sbs_absolute),
+  n_samples = colSums(present[valid, , drop = FALSE]),
+  prevalence_pct = 100 * colMeans(present[valid, , drop = FALSE]),
+  total_activity = colSums(sbs_absolute),
+  dominant_n = sapply(colnames(sbs_absolute),
+                     function(x) sum(sbs_qc$dominant_SBS == x, na.rm = TRUE))
+)
+sbs_summary$cohort_activity_pct <- 100 * sbs_summary$total_activity /
+  sum(sbs_summary$total_activity)
+sbs_summary <- sbs_summary[order(-sbs_summary$prevalence_pct), ]
+sbs_summary
+
+top <- head(sbs_summary, 15)
+ggplot(top, aes(x = reorder(SBS, prevalence_pct), y = prevalence_pct)) +
+  geom_col() +
+  coord_flip() +
+  labs(x = "Firma COSMIC SBS", y = "Muestras con actividad detectable (%)",
+       title = "Prevalencia de firmas SBS") +
+  theme_classic()
+```
+
+```{r sbs-heatmap, fig.width=12, fig.height=9}
+top_sbs <- head(sbs_summary$SBS, 15)
+# Clustering de muestras por la actividad relativa de estas 15 firmas.
+clustering_sbs <- hclust(dist(sbs_relative[valid, top_sbs, drop = FALSE]))
+grupos_sbs <- cutree(clustering_sbs, k = 4)
+
+anotacion_sbs <- data.frame(
+  SUBTYPE = metadata$SUBTYPE[match(names(grupos_sbs), metadata$Tumor_Sample_Barcode)],
+  Cluster = factor(grupos_sbs),
+  row.names = names(grupos_sbs)
+)
+
+pheatmap(
+  t(sbs_relative[valid, top_sbs, drop = FALSE]),
+  cluster_rows = TRUE, cluster_cols = clustering_sbs,
+  cutree_cols = 4,
+  annotation_col = anotacion_sbs,
+  annotation_colors = list(
+    SUBTYPE = c(POLE = "hotpink1", CIN = "blue", MSI = "orange2", GS = "darkgreen")
+  ),
+  show_colnames = FALSE,
+  main = "Actividad relativa de firmas COSMIC SBS (%) - 4 clusters"
+)
+
+table(anotacion_sbs$Cluster, anotacion_sbs$SUBTYPE, useNA = "ifany")
+```
+
+## Asociación de SBS con ancestría AMR
+
+```{r metadata-sbs-amr}
+ancestria_amr <- read_tsv("../files/data_genetic_ancestry.txt",
+                        show_col_types = FALSE) %>%
+  filter(ENTITY_STABLE_ID == "AMR") %>%
+  select(-ENTITY_STABLE_ID, -NAME) %>%
+  pivot_longer(everything(), names_to = "Tumor_Sample_Barcode", values_to = "AMR") %>%
+  mutate(AMR = AMR * 100)
+
+metadata_sbs_amr <- metadata %>%
+  select(Tumor_Sample_Barcode, purity, SEX, AGE) %>%
+  filter(Tumor_Sample_Barcode %in% rownames(sbs_relative)[valid]) %>%
+  left_join(ancestria_amr, by = "Tumor_Sample_Barcode") %>%
+  mutate(SEX = factor(SEX)) %>%
+  drop_na(AMR, purity, SEX, AGE)
+
+nrow(metadata_sbs_amr)
+summary(metadata_sbs_amr$AMR)
+```
+
+```{r modelos-lineales-sbs-amr}
+# Respuesta: actividad relativa (%) de cada firma SBS.
+resultados_sbs_amr <- data.frame(SBS = colnames(sbs_relative),
+                                 beta = NA_real_, p_value = NA_real_)
+
+for (i in seq_len(nrow(resultados_sbs_amr))) {
+  datos <- metadata_sbs_amr
+  datos$actividad <- sbs_relative[datos$Tumor_Sample_Barcode, resultados_sbs_amr$SBS[i]]
+
+  modelo <- lm(actividad ~ AMR + purity + SEX + AGE, data = datos)
+  coeficiente <- summary(modelo)$coefficients["AMR", ]
+  resultados_sbs_amr$beta[i] <- coeficiente["Estimate"]
+  resultados_sbs_amr$p_value[i] <- coeficiente["Pr(>|t|)"]
+}
+
+resultados_sbs_amr$FDR <- p.adjust(resultados_sbs_amr$p_value, method = "BH")
+resultados_sbs_amr <- resultados_sbs_amr %>% arrange(FDR)
+resultados_sbs_amr
+
+firmas_asociadas_amr <- resultados_sbs_amr %>% filter(FDR < 0.05)
+print(paste("Firmas asociadas a AMR (FDR < 0.05):", nrow(firmas_asociadas_amr)))
+firmas_asociadas_amr
+```
+
+```{r volcano-sbs-amr, fig.width=10, fig.height=7}
+datos_volcano_sbs_amr <- resultados_sbs_amr %>%
+  filter(!is.na(FDR)) %>%
+  mutate(asociacion = case_when(
+    FDR < 0.05 & beta > 0 ~ "Mayor actividad",
+    FDR < 0.05 & beta < 0 ~ "Menor actividad",
+    TRUE ~ "No significativo"))
+
+ggplot(datos_volcano_sbs_amr, aes(x = beta, y = -log10(FDR), color = asociacion)) +
+  geom_point(size = 2, alpha = 0.7) +
+  geom_vline(xintercept = 0, linetype = "dashed") +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed") +
+  geom_text(data = firmas_asociadas_amr, aes(label = SBS),
+            color = "black", vjust = -0.5, size = 3, check_overlap = TRUE) +
+  scale_color_manual(values = c("Mayor actividad" = "red3", "Menor actividad" = "steelblue",
+                                "No significativo" = "grey70")) +
+  labs(x = "Cambio de actividad SBS (puntos %) por 1 punto % de AMR",
+       y = "-log10(FDR)", color = "Al aumentar AMR",
+       title = "Asociacion de firmas SBS con ancestria AMR") +
+  theme_classic()
+```
